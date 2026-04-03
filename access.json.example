@@ -1,0 +1,8 @@
+{
+  "dmPolicy": "pairing",
+  "allowFrom": ["YOUR_TELEGRAM_ID_HERE"],
+  "groups": {},
+  "pending": {},
+  "ackReaction": "👍",
+  "sessionTimeout": 3600000
+}

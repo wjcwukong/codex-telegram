@@ -1,0 +1,173 @@
+#!/bin/bash
+# 唤醒 + 解锁 + 截图 + 锁屏 一体化脚本（v8）
+# 用法:
+#   tg-screenshot                                    # 全屏截图
+#   tg-screenshot --app Ghostty                      # 截取 Ghostty 窗口
+#   tg-screenshot --unlock <password> --app Ghostty  # 唤醒+解锁+截取窗口
+#   tg-screenshot --unlock <password>                # 唤醒+解锁+全屏截图
+#   tg-screenshot --lock                             # 锁定屏幕
+
+OUTPUT="/tmp/tg_screenshot.png"
+APP=""
+PASSWORD=""
+LOCK_ONLY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --unlock)  PASSWORD="$2"; shift 2 ;;
+    --app)     APP="$2"; shift 2 ;;
+    -o)        OUTPUT="$2"; shift 2 ;;
+    --lock)    LOCK_ONLY="1"; shift ;;
+    *)         shift ;;
+  esac
+done
+
+# 锁屏模式
+if [ -n "$LOCK_ONLY" ]; then
+  pmset displaysleepnow
+  echo "locked"
+  exit 0
+fi
+
+# 1. 如果需要解锁
+if [ -n "$PASSWORD" ]; then
+  # 持续每秒发唤醒信号，防止屏幕灭（后台运行）
+  ( for i in $(seq 1 30); do caffeinate -u -t 5 & sleep 1; done ) &
+  KEEP_ALIVE_PID=$!
+
+  # 空格唤醒物理屏幕
+  sleep 1
+  osascript -e 'tell application "System Events" to key code 49' 2>/dev/null
+  sleep 3
+
+  # CGEvent: Escape清空 → 点击激活 → keycode输密码 → 回车
+  swift -e '
+import CoreGraphics
+import Foundation
+
+func tap(_ keyCode: CGKeyCode, shift: Bool = false) {
+    var flags: CGEventFlags = []
+    if shift { flags = .maskShift }
+    if let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) {
+        down.flags = flags
+        down.post(tap: .cghidEventTap)
+    }
+    usleep(80000)
+    if let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) {
+        up.flags = flags
+        up.post(tap: .cghidEventTap)
+    }
+    usleep(80000)
+}
+
+// Escape 清空密码框
+tap(53)
+Thread.sleep(forTimeInterval: 0.5)
+
+// 点击用户头像重新激活密码框
+if let d = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: CGPoint(x: 960, y: 540), mouseButton: .left) { d.post(tap: .cghidEventTap) }
+usleep(50000)
+if let u = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: CGPoint(x: 960, y: 540), mouseButton: .left) { u.post(tap: .cghidEventTap) }
+Thread.sleep(forTimeInterval: 1)
+
+// Type password from CLI argument
+let pwd = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
+for ch in pwd {
+    let s = String(ch)
+    let u = Array(s.utf16)
+    if let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true) {
+        down.keyboardSetUnicodeString(stringLength: u.count, unicodeString: u)
+        down.post(tap: .cghidEventTap)
+    }
+    usleep(80000)
+    if let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) {
+        up.post(tap: .cghidEventTap)
+    }
+    usleep(80000)
+}
+
+Thread.sleep(forTimeInterval: 0.3)
+tap(36)               // Return
+' "$PASSWORD" 2>&1
+
+  sleep 3
+  kill $KEEP_ALIVE_PID 2>/dev/null
+  wait $KEEP_ALIVE_PID 2>/dev/null
+  PASSWORD=""
+
+else
+  # 不需要解锁，仅唤醒
+  caffeinate -u -t 10 2>/dev/null &
+  sleep 2
+fi
+
+# 2. 如果指定了 app，激活并截取该窗口；否则全屏截图
+if [ -n "$APP" ]; then
+  # App name mapping: Chinese display names → macOS process names
+  ACTIVATE_NAME="$APP"
+  MATCH_NAMES="$APP"
+  case "$APP" in
+    微信|wechat|WeChat)  ACTIVATE_NAME="WeChat"; MATCH_NAMES="WeChat|微信" ;;
+    QQ)                  MATCH_NAMES="QQ|腾讯QQ" ;;
+  esac
+
+  # 先把目标 app 切到前台、取消最小化，再按窗口 ID 截图。
+  # reopen+activate 恢复窗口；System Events AXMinimized 处理最小化到 Dock 的情况
+  osascript -e "
+tell application \"$ACTIVATE_NAME\"
+    reopen
+    activate
+end tell
+try
+    tell application \"System Events\" to tell process \"$ACTIVATE_NAME\"
+        set value of attribute \"AXMinimized\" of every window to false
+    end tell
+end try
+" 2>/dev/null
+  sleep 3
+
+  # 用 Swift 找到主窗口 ID（优先 on-screen、layer==0、面积最大）
+  WID=$(swift -e "
+import Cocoa
+let names = \"$MATCH_NAMES\".split(separator: \"|\").map { \$0.lowercased() }
+let o: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+var bestWID: Int?
+var bestArea = 0
+var bestOnscreen = false
+if let l = CGWindowListCopyWindowInfo(o, kCGNullWindowID) as? [[String:Any]] {
+    for w in l {
+        guard let n = w[\"kCGWindowOwnerName\"] as? String, names.contains(n.lowercased()),
+              let layer = w[\"kCGWindowLayer\"] as? Int, layer == 0,
+              let b = w[\"kCGWindowBounds\"] as? [String:Any],
+              let h = b[\"Height\"] as? Int,
+              let width = b[\"Width\"] as? Int,
+              let wid = w[\"kCGWindowNumber\"] as? Int
+        else { continue }
+        let onscreen = w[\"kCGWindowIsOnscreen\"] as? Bool ?? false
+        let area = width * h
+        // on-screen 窗口优先；同级别取面积最大
+        if (!bestOnscreen && onscreen) || (onscreen == bestOnscreen && area > bestArea) {
+            bestArea = area
+            bestWID = wid
+            bestOnscreen = onscreen
+        }
+    }
+}
+if let bestWID { print(bestWID) }
+" 2>/dev/null)
+
+  if [ -n "$WID" ]; then
+    screencapture -x -o -l"$WID" "$OUTPUT" 2>/dev/null
+    if [ $? -ne 0 ]; then
+      # 窗口 ID 截取失败，回退全屏
+      screencapture -x "$OUTPUT"
+    fi
+  else
+    # 找不到窗口，全屏截图
+    screencapture -x "$OUTPUT"
+  fi
+else
+  screencapture -x "$OUTPUT"
+fi
+
+echo "$OUTPUT"
